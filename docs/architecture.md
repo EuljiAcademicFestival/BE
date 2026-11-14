@@ -15,15 +15,17 @@ member/
   adapter/
     in/web/                     HTTP 요청 검증과 명령 변환
     out/persistence/            MemberJpaEntity, Mapper, Spring Data 저장소
-    out/security/               비밀번호 해싱, 토큰 저장·검증
+    out/security/               비밀번호 해싱, JWT 발급·검증
 
 guestbook/
   domain/model/, policy/        방명록, 정렬, 커서, 글자 수 규칙
   application/
     port/in/, port/out/         방명록 명령·조회 포트
     service/, result/           좋아요 처리와 조회 결과
+    cache/                      트랜잭션 바깥의 이름표 캐시 유스케이스 장식자
   adapter/in/web/               방명록·캐릭터·순위 API
   adapter/out/persistence/      JDBC 저장과 조회
+  adapter/out/cache/            Caffeine 회원별 이름표 캐시, 커밋 후 무효화
 
 global/
   domain/exception/             오류 코드와 예외
@@ -65,7 +67,12 @@ HTTP 상태와 `status`, `code`, `message`, `data` 응답 구조는 명세를 �
 - 방명록은 앞뒤 공백을 제거하고 Java 정규식 `\X`의 확장 grapheme cluster 기준 1~100자로 검증한다.
   결합 문자·국기·피부색·가족 이모지를 UTF-16 길이로 세지 않는다.
 - 좋아요와 프로필 수정은 대상 방명록을 `SELECT ... FOR UPDATE`로 먼저 잠근다.
-  좋아요 존재 확인도 locking read이며, 기록 변경과 집계 변경은 같은 트랜잭션이다.
+  좋아요는 사전 locking read 없이 실제 추가·삭제 여부로 집계를 변경하며, 기록과 집계 변경은 같은 트랜잭션이다.
+- 이름표·상세·순위·방명록 목록은 읽기 전용 서비스 트랜잭션으로 조회한다.
+  이 트랜잭션 제거 실험은 200 VU 두 실행에서 API 지연 개선을 확인하지 못해 채택하지 않았다.
+- 이름표 조회는 트랜잭션 바깥의 캐시 유스케이스가 먼저 확인한다. 적중 시 DB 조회·연결을 생략하며,
+  미스 회원들만 기존 조회 서비스에 일괄 위임한다. 이름·학년 수정은 커밋 후 무효화하고 롤백 시 유지한다.
+  진행 중인 트랜잭션 안에서 호출되면 캐시를 우회해 미커밋 값이 캐시에 저장되지 않게 한다.
 - DB의 DATETIME(6)은 UTC로 쓰고 읽는다. 응답은 UTC ISO 8601이며, 조회 요청마다 기준 시각을 한 번 잡는다.
 - `RANK() OVER (ORDER BY like_count DESC)`로 동점이면 같은 순위, 다음 순위는 인원수만큼 건너뛴다.
   조회 필터와 페이지 경계는 전역 순위를 계산한 후 적용한다. 0개 좋아요도 같은 순위 규칙을 적용한다.
@@ -76,14 +83,18 @@ HTTP 상태와 `status`, `code`, `message`, `data` 응답 구조는 명세를 �
 
 ## 명세에서 미정인 정책에 대한 구현 기본값
 
-액세스 토큰은 SecureRandom의 32바이트를 Base64 URL로 인코딩한 opaque token이다.
-DB에는 SHA-256 해시만 저장하며 유효 기간은 기본 1시간이다.
+액세스 토큰은 HS256으로 서명한 JWT다. 발급자, 회원 ID(`sub`), 용도(`token_type=access`),
+발급·만료 시각과 고유 ID를 포함한다. 인증은 서명·알고리즘·발급자·용도·시각·회원 ID를
+검증하며 DB 조회와 트랜잭션을 사용하지 않는다. 유효 기간은 기본 1시간이다.
 `ACCESS_TOKEN_TTL=PT2H`처럼 ISO 8601 Duration으로 변경할 수 있다. 토큰 원문·비밀번호는
 응답 외 로그에 기록하지 않는다. 만료되면 다시 로그인한다. 토큰 갱신·로그아웃 API는 명세에 없다.
-만료된 토큰 레코드의 주기적 정리는 별도 운영 작업으로 둘 수 있다.
+`JWT_SECRET`은 최소 32바이트 난수의 Base64 인코딩 값이며 필수 환경변수다.
+기존 랜덤 토큰은 JWT 전환 후 거부되므로 다시 로그인해야 한다.
+회원 삭제나 기존 `access_tokens` 행 삭제로 JWT가 즉시 폐기되지는 않는다.
+이는 DB 조회 없는 JWT 전환으로 바뀐 인증 정책이며, 즉시 폐기가 필요하면 별도 상태 검증을 설계해야 한다.
 
-`V1__init.sql`은 변경하지 않았다. `V2__create_access_tokens.sql`만 추가하므로 기존 회원과
-방명록 데이터는 유지된다. 앱을 다음에 실행하면 Flyway가 V2를 적용한다.
+기존 V1·V2 마이그레이션과 회원·방명록 데이터는 유지한다.
+V2의 `access_tokens` 테이블은 이력 호환을 위해 남겨두며 JWT 발급·검증에는 사용하지 않는다.
 
 근접 거리 판단, 캐릭터 이동, 순위 갱신 주기, 화면 스크롤·정렬 전환 응답 처리는 클라이언트 영역이며
 서버 API에는 근접 거리나 이동 프로토콜을 추가하지 않았다.

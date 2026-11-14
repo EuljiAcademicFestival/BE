@@ -1,6 +1,10 @@
 package com.example.backend;
 
 import com.example.backend.guestbook.application.port.in.GuestbookCommandUseCase;
+import com.example.backend.guestbook.application.port.out.GuestbookQueryPort;
+import com.example.backend.guestbook.application.result.EntryView;
+import com.example.backend.guestbook.domain.model.GuestbookCursor;
+import com.example.backend.guestbook.domain.model.GuestbookSort;
 import com.example.backend.member.application.command.SignupCommand;
 import com.example.backend.member.application.port.in.MemberCommandUseCase;
 import com.example.backend.member.application.port.out.AccessTokenPort;
@@ -26,6 +30,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @AutoConfigureObservability(tracing = false)
 @EnabledIfEnvironmentVariable(named = "TEST_DB_URL", matches = ".+")
 class BackendApplicationTests {
+    private static final String JWT_TEST_SECRET = Base64.getEncoder().encodeToString(new byte[32]);
     @DynamicPropertySource
     static void database(DynamicPropertyRegistry registry) {
         String url = System.getenv("TEST_DB_URL");
@@ -35,17 +40,27 @@ class BackendApplicationTests {
         registry.add("spring.datasource.url", () -> url);
         registry.add("spring.datasource.username", () -> System.getenv().getOrDefault("TEST_DB_USERNAME", "root"));
         registry.add("spring.datasource.password", () -> System.getenv().getOrDefault("TEST_DB_PASSWORD", ""));
+        registry.add("security.jwt-secret", () -> JWT_TEST_SECRET);
+        registry.add("security.jwt-issuer", () -> "eulji-academic-festival");
     }
     @Autowired MockMvc mvc;
     @Autowired JdbcTemplate jdbc;
     @Autowired ObjectMapper json;
     @Autowired MemberCommandUseCase members;
     @Autowired GuestbookCommandUseCase likes;
+    @Autowired GuestbookQueryPort queries;
     @Autowired AccessTokenPort tokens;
+    @Autowired com.example.backend.member.application.port.in.AuthenticateMemberUseCase authentication;
+    @Autowired io.micrometer.core.instrument.MeterRegistry metrics;
     @Autowired javax.sql.DataSource dataSource;
     @Autowired org.springframework.transaction.PlatformTransactionManager transactionManager;
     @org.springframework.test.context.bean.override.mockito.MockitoSpyBean
     com.example.backend.guestbook.adapter.out.persistence.GuestbookPersistenceAdapter persistence;
+    @org.springframework.test.context.bean.override.mockito.MockitoSpyBean
+    com.example.backend.member.adapter.out.security.AccessTokenAdapter tokenAdapter;
+    @org.springframework.test.context.bean.override.mockito.MockitoSpyBean
+    com.example.backend.guestbook.adapter.out.persistence.GuestbookQueryAdapter queryAdapter;
+    @Autowired com.example.backend.guestbook.application.port.in.GuestbookQueryUseCase cachedQueries;
 
     @BeforeEach
     void cleanTestDatabase() {
@@ -157,12 +172,134 @@ class BackendApplicationTests {
         mvc.perform(get("/api/guestbook").header("Authorization", "Basic ignored"))
                 .andExpect(status().isUnauthorized());
         String token = login("visitor@example.com");
-        assertThat(jdbc.queryForObject("SELECT token_hash FROM access_tokens", String.class)).isNotEqualTo(token);
+        assertThat(token.split("\\.")).hasSize(3);
+        assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM access_tokens", Long.class)).isZero();
         mvc.perform(get("/api/guestbook").header("Authorization", "Bearer " + token))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.data.entries[0].memberId").value(id));
-        jdbc.update("UPDATE access_tokens SET expires_at = '2000-01-01'");
-        mvc.perform(get("/api/guestbook").header("Authorization", "Bearer " + token))
+        mvc.perform(get("/api/guestbook").header("Authorization", "Bearer " + expiredToken(id)))
                 .andExpect(status().isUnauthorized()).andExpect(jsonPath("$.code").value("AUTH_401_001"));
+    }
+
+    @Test
+    void authenticationVerifiesJwtWithoutStartingATransaction() throws Exception {
+        long id = fixture("auth-boundary@example.com");
+        String token = tokens.issue(id);
+        org.mockito.Mockito.doAnswer(invocation -> {
+            assertThat(org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive())
+                    .as("JWT authentication must not start a service transaction")
+                    .isFalse();
+            return invocation.callRealMethod();
+        }).when(tokenAdapter).authenticate(token);
+        mvc.perform(get("/api/characters").param("memberIds", String.valueOf(id))
+                        .header("Authorization", "Bearer " + token))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.data.characters[0].memberId").value(id));
+    }
+
+    @Test
+    void jwtAuthenticationIsIndependentOfLegacyTokensAndMemberDeletion() throws Exception {
+        long id = fixture("auth-state@example.com");
+        long target = fixture("auth-target@example.com");
+        String token = tokens.issue(id);
+        var requestPath = "/api/characters/" + target;
+        mvc.perform(get(requestPath).header("Authorization", "Bearer " + token)).andExpect(status().isOk());
+        // Stateless JWTs remain valid until expiry; legacy rows and member deletion do not revoke them.
+        jdbc.update("DELETE FROM access_tokens");
+        mvc.perform(get(requestPath).header("Authorization", "Bearer " + token)).andExpect(status().isOk());
+        jdbc.update("DELETE FROM members WHERE id = ?", id);
+        mvc.perform(get(requestPath).header("Authorization", "Bearer " + token)).andExpect(status().isOk());
+        for (String header : List.of("Bearer ", "Bearer invalid", "Bearer " + "A".repeat(43), "Basic invalid")) {
+            mvc.perform(get(requestPath).header("Authorization", header)).andExpect(status().isUnauthorized());
+        }
+    }
+
+    @Test
+    void jwtIssueAndAuthenticationDoNotAcquireDatabaseConnections() {
+        var timers = metrics.find("hikaricp.connections.acquire").timers();
+        assertThat(timers).isNotEmpty();
+        long before = timers.stream().mapToLong(io.micrometer.core.instrument.Timer::count).sum();
+        String token = tokens.issue(42);
+        for (int i = 0; i < 10; i++) {
+            assertThat(authentication.authenticate(token)).contains(42L);
+            assertThat(authentication.authenticate("invalid")).isEmpty();
+        }
+        long after = timers.stream().mapToLong(io.micrometer.core.instrument.Timer::count).sum();
+        assertThat(after).as("JWT issue/verification must not borrow a DB connection").isEqualTo(before);
+    }
+
+    private String expiredToken(long memberId) {
+        var clock = java.time.Clock.fixed(java.time.Instant.now().minusSeconds(7200), java.time.ZoneOffset.UTC);
+        return new com.example.backend.member.adapter.out.security.AccessTokenAdapter(clock, java.time.Duration.ofHours(1),
+                JWT_TEST_SECRET, "eulji-academic-festival").issue(memberId);
+    }
+
+    private long connectionAcquisitions() {
+        var timers = metrics.find("hikaricp.connections.acquire").timers();
+        assertThat(timers).isNotEmpty();
+        return timers.stream().mapToLong(io.micrometer.core.instrument.Timer::count).sum();
+    }
+
+    @Test
+    void labelCacheHitsSkipTransactionsAndConnectionsAndMissesUseOneBatch() throws Exception {
+        long a = fixture("label-a@example.com"), b = fixture("label-b@example.com");
+        String auth = "Bearer " + tokens.issue(a);
+        mvc.perform(get("/api/characters").param("memberIds", b + "," + a + "," + a).header("Authorization", auth))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.data.characters.length()").value(2))
+                .andExpect(jsonPath("$.data.characters[0].memberId").value(a));
+        long before = connectionAcquisitions();
+        mvc.perform(get("/api/characters").param("memberIds", a + "," + b).header("Authorization", auth))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.data.characters[1].memberId").value(b));
+        assertThat(connectionAcquisitions()).isEqualTo(before);
+        long c = fixture("label-c@example.com"), d = fixture("label-d@example.com");
+        org.mockito.Mockito.clearInvocations(queryAdapter);
+        before = connectionAcquisitions();
+        mvc.perform(get("/api/characters").param("memberIds", d + "," + a + "," + c + "," + b).header("Authorization", auth))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.data.characters.length()").value(4));
+        assertThat(connectionAcquisitions()).isEqualTo(before + 1);
+        org.mockito.Mockito.verify(queryAdapter).labels(List.of(c, d));
+    }
+
+    @Test
+    void profileCommitInvalidatesLabelsOnlyAfterCommit() throws Exception {
+        long id = fixture("label-commit@example.com");
+        assertThat(cachedQueries.labels(List.of(id)).get(0).name()).isEqualTo("이름");
+        ExecutorService reader = Executors.newSingleThreadExecutor();
+        try {
+            new org.springframework.transaction.support.TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+                members.updateProfile(new com.example.backend.member.application.command.UpdateProfileCommand(id, 1, "수정 이름", "졸업생", "수정"));
+                try { assertThat(reader.submit(() -> cachedQueries.labels(List.of(id)).get(0).name()).get(5, TimeUnit.SECONDS)).isEqualTo("이름"); }
+                catch (Exception e) { throw new RuntimeException(e); }
+            });
+        } finally { reader.shutdownNow(); }
+        var label = cachedQueries.labels(List.of(id)).get(0);
+        assertThat(label.name()).isEqualTo("수정 이름");
+        assertThat(label.grade()).isEqualTo("졸업생");
+        long before = connectionAcquisitions();
+        cachedQueries.labels(List.of(id));
+        assertThat(connectionAcquisitions()).isEqualTo(before);
+    }
+
+    @Test
+    void transactionalLabelReadsBypassCacheAndRollbackDoesNotEvictOrPublish() {
+        long id = fixture("label-rollback@example.com");
+        cachedQueries.labels(List.of(id));
+        new org.springframework.transaction.support.TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+            members.updateProfile(new com.example.backend.member.application.command.UpdateProfileCommand(id, 1, "미커밋 이름", "게스트", "수정"));
+            assertThat(cachedQueries.labels(List.of(id)).get(0).name()).isEqualTo("미커밋 이름");
+            status.setRollbackOnly();
+        });
+        long before = connectionAcquisitions();
+        assertThat(cachedQueries.labels(List.of(id)).get(0).name()).isEqualTo("이름");
+        assertThat(connectionAcquisitions()).isEqualTo(before);
+    }
+
+    @Test
+    void unchangedNameAndGradeDoNotEvictLabelCache() {
+        long id = fixture("label-message-only@example.com");
+        cachedQueries.labels(List.of(id));
+        members.updateProfile(new com.example.backend.member.application.command.UpdateProfileCommand(id, 6, "이름", "게스트", "내용만 수정"));
+        long before = connectionAcquisitions();
+        assertThat(cachedQueries.labels(List.of(id)).get(0).name()).isEqualTo("이름");
+        assertThat(connectionAcquisitions()).isEqualTo(before);
     }
 
     @Test
@@ -462,5 +599,73 @@ class BackendApplicationTests {
                 .andExpect(jsonPath("$.data.nextCursor").value(org.hamcrest.Matchers.nullValue()));
         mvc.perform(get("/api/rankings/top").header("Authorization", auth))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.data.rankings").isEmpty());
+    }
+
+    @Test
+    void optimizedQueriesMatchFullGlobalRankingAcrossTiesAndPages() {
+        List<int[]> distributions = List.of(new int[0], new int[]{0}, new int[]{5, 5},
+                new int[]{0, 0, 0, 0, 0, 0}, new int[]{9, 9, 9, 8, 7},
+                new int[]{9, 9, 8, 8, 8, 7}, new int[]{9, 8, 8, 8, 7},
+                new int[]{9, 8, 7, 7, 7, 0},
+                new Random(20261115).ints(120, 0, 20).toArray());
+        for (int[] counts : distributions) {
+            cleanTestDatabase();
+            List<Long> ids = new ArrayList<>();
+            for (int i = 0; i < counts.length; i++) {
+                long id = fixture("query" + i + "@example.com");
+                ids.add(id);
+                // Tied scores, tied times, and different creation dates exercise every cursor key.
+                jdbc.update("UPDATE guestbook_entries SET like_count = ?, created_at = ? WHERE member_id = ?",
+                        counts[i], java.time.LocalDateTime.of(2026, 11, 10, 0, 0).plusSeconds(i % 4), id);
+            }
+            long viewer = ids.isEmpty() ? 0 : ids.get(0);
+            for (int i = 1; i < ids.size(); i += 2) {
+                jdbc.update("INSERT INTO guestbook_likes (entry_member_id, liker_member_id) VALUES (?, ?)", ids.get(i), viewer);
+            }
+            List<EntryView> global = fullRankingReference(0, GuestbookSort.POPULAR);
+            assertThat(queries.topRankings()).containsExactlyElementsOf(global.stream().filter(e -> e.rank() != null).toList());
+            assertThat(queries.detail(Long.MAX_VALUE)).isEmpty();
+            for (EntryView entry : global) assertThat(queries.detail(entry.memberId())).contains(entry);
+            for (GuestbookSort sort : GuestbookSort.values()) {
+                List<EntryView> expected = fullRankingReference(viewer, sort);
+                for (int size : List.of(1, 3, 21, 100)) {
+                    GuestbookCursor cursor = null;
+                    int offset = 0;
+                    while (true) {
+                        List<EntryView> page = queries.page(viewer, sort, cursor, size);
+                        assertThat(page).containsExactlyElementsOf(expected.subList(offset, Math.min(offset + size, expected.size())));
+                        if (page.isEmpty()) break;
+                        offset += page.size();
+                        EntryView last = page.get(page.size() - 1);
+                        cursor = new GuestbookCursor(sort, last.likeCount(), last.createdAt(), last.memberId());
+                    }
+                    assertThat(offset).isEqualTo(expected.size());
+                }
+            }
+        }
+    }
+
+    private List<EntryView> fullRankingReference(long viewer, GuestbookSort sort) {
+        // Independent reference: rank ALL rows before filtering/pagination, as the original contract requires.
+        String sql = """
+                WITH ranked AS (
+                    SELECT member_id, message, like_count, created_at,
+                           RANK() OVER (ORDER BY like_count DESC) AS global_rank
+                    FROM guestbook_entries
+                )
+                SELECT m.id, m.character_id, m.grade, m.name, r.message, r.created_at, r.like_count,
+                       CASE WHEN r.global_rank <= 3 THEN r.global_rank ELSE NULL END AS member_rank,
+                       EXISTS(SELECT 1 FROM guestbook_likes l WHERE l.entry_member_id = m.id
+                              AND l.liker_member_id = ?) AS liked_by_me
+                FROM ranked r JOIN members m ON m.id = r.member_id
+                ORDER BY
+                """ + (sort == GuestbookSort.POPULAR ? "r.like_count DESC, " : "") + "r.created_at DESC, r.member_id ASC";
+        return jdbc.query(sql, (rs, row) -> {
+            Number rank = (Number) rs.getObject("member_rank");
+            return new EntryView(rs.getLong("id"), rs.getInt("character_id"), rs.getString("grade"), rs.getString("name"),
+                    rank == null ? null : rank.intValue(), rs.getString("message"),
+                    rs.getObject("created_at", java.time.LocalDateTime.class).toInstant(java.time.ZoneOffset.UTC),
+                    rs.getLong("like_count"), rs.getBoolean("liked_by_me"));
+        }, viewer);
     }
 }

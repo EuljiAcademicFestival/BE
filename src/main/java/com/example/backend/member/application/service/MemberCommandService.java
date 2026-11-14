@@ -2,6 +2,7 @@ package com.example.backend.member.application.service;
 
 import com.example.backend.global.domain.exception.*;
 import com.example.backend.guestbook.application.port.out.GuestbookPort;
+import com.example.backend.guestbook.application.port.out.CharacterLabelCachePort;
 import com.example.backend.guestbook.domain.model.GuestbookEntry;
 import com.example.backend.guestbook.domain.policy.GuestbookPolicy;
 import com.example.backend.member.application.command.*;
@@ -22,6 +23,7 @@ public class MemberCommandService implements MemberCommandUseCase {
     private final GuestbookPort guestbook;
     private final PasswordHashPort passwords;
     private final AccessTokenPort tokens;
+    private final CharacterLabelCachePort labels;
 
     @Override
     public SignupResult signup(SignupCommand command) {
@@ -58,6 +60,9 @@ public class MemberCommandService implements MemberCommandUseCase {
                 .orElseThrow(() -> new BusinessException(ErrorCode.AUTH_401_001));
         members.save(member.withProfile(profile));
         guestbook.updateMessage(entry.withMessage(message));
+        if (!member.name().equals(profile.name()) || !member.grade().equals(profile.grade())) {
+            labels.evictAfterCommit(member.id());
+        }
         return new ProfileResult(member.id(), profile.characterId(), profile.name(), profile.grade(), message, entry.likeCount());
     }
 

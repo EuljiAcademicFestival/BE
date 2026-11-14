@@ -5,6 +5,7 @@ import com.example.backend.guestbook.application.port.in.GuestbookQueryUseCase;
 import com.example.backend.guestbook.application.port.out.GuestbookQueryPort;
 import com.example.backend.guestbook.application.result.*;
 import com.example.backend.guestbook.domain.model.*;
+import com.example.backend.guestbook.domain.policy.CharacterLabelPolicy;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -18,10 +19,7 @@ public class GuestbookQueryService implements GuestbookQueryUseCase {
     private final GuestbookQueryPort queries;
     private final Clock clock;
     public List<CharacterLabel> labels(List<Long> memberIds) {
-        if (memberIds == null || memberIds.isEmpty() || memberIds.stream().anyMatch(id -> id == null || id <= 0)) {
-            throw new BusinessException(ErrorCode.CHARACTER_INVALID_INPUT);
-        }
-        return queries.labels(memberIds.stream().distinct().toList());
+        return queries.labels(CharacterLabelPolicy.normalizeIds(memberIds));
     }
     public EntryView detail(long memberId) {
         if (memberId <= 0) throw new BusinessException(ErrorCode.CHARACTER_INVALID_INPUT);
