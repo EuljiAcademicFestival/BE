@@ -8,12 +8,13 @@ import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
-import tools.jackson.databind.*;
+import com.fasterxml.jackson.databind.*;
 import java.util.*;
 import java.util.concurrent.*;
 import static org.assertj.core.api.Assertions.*;
@@ -22,6 +23,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 @SpringBootTest
 @AutoConfigureMockMvc
+@AutoConfigureObservability(tracing = false)
 @EnabledIfEnvironmentVariable(named = "TEST_DB_URL", matches = ".+")
 class BackendApplicationTests {
     @DynamicPropertySource
@@ -40,6 +42,10 @@ class BackendApplicationTests {
     @Autowired MemberCommandUseCase members;
     @Autowired GuestbookCommandUseCase likes;
     @Autowired AccessTokenPort tokens;
+    @Autowired javax.sql.DataSource dataSource;
+    @Autowired org.springframework.transaction.PlatformTransactionManager transactionManager;
+    @org.springframework.test.context.bean.override.mockito.MockitoSpyBean
+    com.example.backend.guestbook.adapter.out.persistence.GuestbookPersistenceAdapter persistence;
 
     @BeforeEach
     void cleanTestDatabase() {
@@ -48,7 +54,7 @@ class BackendApplicationTests {
         jdbc.update("DELETE FROM guestbook_entries");
         jdbc.update("DELETE FROM members");
     }
-    private String signupBody(String email, String message) {
+    private String signupBody(String email, String message) throws com.fasterxml.jackson.core.JsonProcessingException {
         return json.writeValueAsString(Map.of("email", email, "password", "pw", "characterId", 3,
                 "name", "김을지", "grade", "게스트", "guestbookMessage", message));
     }
@@ -64,6 +70,45 @@ class BackendApplicationTests {
                 .andExpect(status().isOk()).andExpect(jsonPath("$.code").value("AUTH_LOGIN_200"))
                 .andReturn().getResponse().getContentAsString();
         return json.readTree(body).path("data").path("accessToken").asText();
+    }
+
+    @Test
+    void logsAreCorrelatedAndRoutedToApplicationErrorAndPerformanceFiles() throws Exception {
+        long id = fixture("logging@example.com");
+        String token = tokens.issue(id);
+        var response = mvc.perform(get("/api/characters").param("memberIds", Long.toString(id))
+                        .header("Authorization", "Bearer " + token))
+                .andExpect(status().isOk()).andReturn().getResponse();
+        String traceId = response.getHeader("X-Trace-Id");
+        assertThat(traceId).matches("[a-f0-9]{32}");
+        var context = (ch.qos.logback.classic.LoggerContext) org.slf4j.LoggerFactory.getILoggerFactory();
+        var root = context.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+        var application = (ch.qos.logback.core.FileAppender<?>) root.getAppender("FILE");
+        var errors = (ch.qos.logback.core.FileAppender<?>) root.getAppender("ERROR_FILE");
+        var performance = (ch.qos.logback.core.FileAppender<?>) context
+                .getLogger("com.example.backend.global.infrastructure.aop.PerformanceLogAspect")
+                .getAppender("PERFORMANCE_FILE");
+        String normalMarker = "normal-marker-" + UUID.randomUUID();
+        String errorMarker = "error-marker-" + UUID.randomUUID();
+        var logger = org.slf4j.LoggerFactory.getLogger("com.example.backend.logging.Check");
+        logger.info(normalMarker);
+        logger.error(errorMarker);
+        String applicationLog = java.nio.file.Files.readString(java.nio.file.Path.of(application.getFile()));
+        String errorLog = java.nio.file.Files.readString(java.nio.file.Path.of(errors.getFile()));
+        String performanceLog = java.nio.file.Files.readString(java.nio.file.Path.of(performance.getFile()));
+        assertThat(applicationLog).contains(traceId, "[/api/characters]", "event=http_request", normalMarker, errorMarker)
+                .doesNotContain(token);
+        assertThat(errorLog).contains(errorMarker).doesNotContain(normalMarker);
+        assertThat(performanceLog).contains(traceId, "event=performance", "GuestbookQueryService.labels");
+        assertThat(org.slf4j.MDC.get("traceId")).isNull();
+    }
+
+    @Test
+    void prometheusMetricsArePublicWhileOtherProtectedEndpointsRequireAuthentication() throws Exception {
+        mvc.perform(get("/actuator/prometheus")).andExpect(status().isOk())
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("jvm_memory_used_bytes")));
+        mvc.perform(get("/actuator/metrics")).andExpect(status().isUnauthorized());
+        mvc.perform(get("/api/guestbook")).andExpect(status().isUnauthorized());
     }
 
     @Test
@@ -257,6 +302,90 @@ class BackendApplicationTests {
     private void assertLikeCount(long target, long expected) {
         assertThat(jdbc.queryForObject("SELECT like_count FROM guestbook_entries WHERE member_id = ?", Long.class, target)).isEqualTo(expected);
         assertThat(jdbc.queryForObject("SELECT COUNT(*) FROM guestbook_likes WHERE entry_member_id = ?", Long.class, target)).isEqualTo(expected);
+    }
+
+    @Test
+    void likesOnDifferentEntriesDoNotDeadlockOnAnEmptyIndexGap() throws Exception {
+        long first = fixture("first@example.com");
+        long second = fixture("second@example.com");
+        long viewer = fixture("viewer@example.com");
+        long otherViewer = fixture("other@example.com");
+        CountDownLatch inserting = new CountDownLatch(1);
+        org.mockito.Mockito.doAnswer(invocation -> {
+            inserting.countDown();
+            return invocation.callRealMethod();
+        }).when(persistence).add(first, viewer);
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try (var guard = dataSource.getConnection()) {
+            guard.setAutoCommit(false);
+            Future<?> request = null;
+            try (var statement = guard.createStatement()) {
+                statement.executeQuery("SELECT member_id FROM guestbook_entries WHERE member_id = " + second + " FOR UPDATE").close();
+                statement.executeQuery("SELECT liker_member_id FROM guestbook_likes WHERE entry_member_id = " + second
+                        + " AND liker_member_id = " + otherViewer + " FOR UPDATE").close();
+                request = worker.submit(() -> likes.setLike(first, viewer, true));
+                assertThat(inserting.await(5, TimeUnit.SECONDS)).isTrue();
+                statement.executeUpdate("INSERT INTO guestbook_likes (entry_member_id, liker_member_id) VALUES (" + second + ", " + otherViewer + ")");
+                statement.executeUpdate("UPDATE guestbook_entries SET like_count = 1 WHERE member_id = " + second);
+                guard.commit();
+                request.get(15, TimeUnit.SECONDS);
+            } finally {
+                guard.rollback();
+                if (request != null) {
+                    try { request.get(15, TimeUnit.SECONDS); }
+                    catch (ExecutionException ignored) { /* Original failure is reported above. */ }
+                }
+            }
+        } finally { worker.shutdownNow(); }
+        assertLikeCount(first, 1);
+        assertLikeCount(second, 1);
+    }
+
+    @Test
+    void mixedProfileAndLikeWritesKeepCountsConsistent() throws Exception {
+        List<Long> ids = new ArrayList<>();
+        for (int i = 0; i < 12; i++) ids.add(fixture("mixed" + i + "@example.com"));
+        ExecutorService pool = Executors.newFixedThreadPool(8);
+        try {
+            List<Callable<Void>> tasks = new ArrayList<>();
+            for (long viewer : ids) tasks.add(() -> {
+                for (long target : ids) {
+                    likes.setLike(target, viewer, true);
+                    likes.setLike(target, viewer, true);
+                    members.updateProfile(new com.example.backend.member.application.command.UpdateProfileCommand(
+                            viewer, 1, "이름", "게스트", "수정"));
+                    likes.setLike(target, viewer, false);
+                    likes.setLike(target, viewer, false);
+                }
+                return null;
+            });
+            for (var future : pool.invokeAll(tasks)) future.get(20, TimeUnit.SECONDS);
+        } finally { pool.shutdownNow(); }
+        for (long id : ids) assertLikeCount(id, 0);
+    }
+
+    @Test
+    void duplicateLikeUsesCurrentStateEvenAfterAnOlderTransactionSnapshot() throws Exception {
+        long target = fixture("snapshot-target@example.com");
+        long viewer = fixture("snapshot-viewer@example.com");
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try {
+            new org.springframework.transaction.support.TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+                assertLikeCount(target, 0); // Establish a REPEATABLE READ snapshot.
+                try { worker.submit(() -> likes.setLike(target, viewer, true)).get(10, TimeUnit.SECONDS); }
+                catch (Exception failure) { throw new RuntimeException(failure); }
+                assertThat(likes.setLike(target, viewer, true).likeCount()).isEqualTo(1);
+            });
+        } finally { worker.shutdownNow(); }
+        assertLikeCount(target, 1);
+    }
+
+    @Test
+    void invalidLikerRollsBackInsteadOfBeingTreatedAsADuplicate() {
+        long target = fixture("fk-target@example.com");
+        assertThatThrownBy(() -> likes.setLike(target, Long.MAX_VALUE, true))
+                .isInstanceOf(org.springframework.dao.DataIntegrityViolationException.class);
+        assertLikeCount(target, 0);
     }
 
     @Test

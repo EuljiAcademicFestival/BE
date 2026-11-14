@@ -4,6 +4,7 @@ import com.example.backend.guestbook.application.port.out.*;
 import com.example.backend.guestbook.domain.model.GuestbookEntry;
 import lombok.RequiredArgsConstructor;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Repository;
 import java.time.Clock;
 import java.time.LocalDateTime;
@@ -35,16 +36,16 @@ public class GuestbookPersistenceAdapter implements GuestbookPort, GuestbookLike
     public void updateLikeCount(long memberId, long count) {
         jdbc.update("UPDATE guestbook_entries SET like_count = ? WHERE member_id = ?", count, memberId);
     }
-    public boolean exists(long memberId, long likerId) {
-        // A locking read avoids stale snapshots even when called from an existing transaction.
-        return !jdbc.query("SELECT liker_member_id FROM guestbook_likes "
-                + "WHERE entry_member_id = ? AND liker_member_id = ? FOR UPDATE",
-                (rs, row) -> rs.getLong(1), memberId, likerId).isEmpty();
+    public boolean add(long memberId, long likerId) {
+        // The entry row lock serializes its writers. Avoid locking a missing like's index gap.
+        try {
+            return jdbc.update("INSERT INTO guestbook_likes (entry_member_id, liker_member_id) VALUES (?, ?)", memberId, likerId) > 0;
+        } catch (DuplicateKeyException alreadyLiked) {
+            // MySQL rolls back only this statement; other integrity failures must propagate.
+            return false;
+        }
     }
-    public void add(long memberId, long likerId) {
-        jdbc.update("INSERT INTO guestbook_likes (entry_member_id, liker_member_id) VALUES (?, ?)", memberId, likerId);
-    }
-    public void remove(long memberId, long likerId) {
-        jdbc.update("DELETE FROM guestbook_likes WHERE entry_member_id = ? AND liker_member_id = ?", memberId, likerId);
+    public boolean remove(long memberId, long likerId) {
+        return jdbc.update("DELETE FROM guestbook_likes WHERE entry_member_id = ? AND liker_member_id = ?", memberId, likerId) > 0;
     }
 }

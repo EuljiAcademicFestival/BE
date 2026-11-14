@@ -38,3 +38,9 @@ out/
 
 ### VS Code ###
 .vscode/
+
+# Local logs and monitoring state
+/logs/
+/monitoring/loki/data/
+/monitoring/promtail/promtail-positions.yml
+/k6/results/

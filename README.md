@@ -1,5 +1,10 @@
 # BE
 
+## 개발 환경
+
+Gymjjak 백엔드와 같은 Java 17, Spring Boot 3.5.14, Gradle 8.14.4,
+springdoc-openapi 2.8.16을 사용합니다.
+
 ## 로컬 DB 연결
 
 MySQL 8.0.16 이상을 사용합니다. 빈 `eulji_festival` DB와 해당 DB에 접근할
@@ -62,3 +67,14 @@ Swagger의 `visitor@example.com`은 입력 예시이므로 이미 가입했다�
 토큰의 기본 유효 기간은 1시간이며 만료되면 다시 로그인하고 Authorize 값을 교체합니다.
 API 문서 JSON은 `/v3/api-docs`에서 확인할 수 있습니다.
 Swagger UI와 문서는 인증 없이 열리지만 회원가입·로그인 외 API의 인증은 유지됩니다.
+
+## 로그 수집
+
+Gymjjak과 같은 Logback → Promtail → Loki → Grafana 방식으로 구성했습니다.
+일반·에러·성능 로그, 요청 traceId, 실행 명령과 Grafana 설정은
+[로컬 로그 수집 안내](monitoring/README.md)를 참고합니다.
+
+## k6 부하 테스트
+
+1 VU 실행 확인, 조회·혼합·좋아요 집중 부하와 결과 해석은
+[k6 실행 안내](k6/README.md)를 참고합니다. 전용 테스트 계정을 생성하므로 테스트 DB 사용을 권장합니다.

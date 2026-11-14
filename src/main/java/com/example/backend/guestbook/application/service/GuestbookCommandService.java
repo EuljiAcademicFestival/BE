@@ -19,11 +19,10 @@ public class GuestbookCommandService implements GuestbookCommandUseCase {
         if (memberId <= 0) throw new BusinessException(ErrorCode.GUESTBOOK_INVALID_MEMBER_ID);
         var entry = guestbook.lockByMemberId(memberId)
                 .orElseThrow(() -> new BusinessException(ErrorCode.GUESTBOOK_NOT_FOUND));
-        boolean exists = likes.exists(memberId, likerId);
         long count = entry.likeCount();
-        if (exists != liked) {
-            if (liked) { likes.add(memberId, likerId); count++; }
-            else { likes.remove(memberId, likerId); count--; }
+        boolean changed = liked ? likes.add(memberId, likerId) : likes.remove(memberId, likerId);
+        if (changed) {
+            count += liked ? 1 : -1;
             guestbook.updateLikeCount(memberId, count);
         }
         return new LikeResult(memberId, liked, count);

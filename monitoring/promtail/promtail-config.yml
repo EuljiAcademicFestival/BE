@@ -1,0 +1,75 @@
+# 로컬 실행 전용. Backend 프로젝트 루트에서 실행합니다.
+server:
+  http_listen_address: 127.0.0.1
+  # Promtail 자체 HTTP 포트
+  # /metrics, /ready 등 상태 확인용
+  http_listen_port: 9080
+
+  # 단순 파일 로그 수집 용도에서는 gRPC 불필요
+  grpc_listen_port: 0
+
+positions:
+  # Promtail이 어디까지 로그를 읽었는지 저장하는 파일
+  # 상대경로를 사용하므로 팀원별 프로젝트 위치가 달라도 동작
+  filename: ./monitoring/promtail/promtail-positions.yml
+
+clients:
+  # 로컬에서 실행 중인 Loki로 로그 전송
+  # 같은 Mac에서 실행하는 Loki로 전송
+  - url: http://127.0.0.1:3100/loki/api/v1/push
+
+scrape_configs:
+  # 일반 애플리케이션 로그 + 에러 로그 수집
+  - job_name: eulji-festival-local-application-logs
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          service: backend
+          app: eulji-festival
+          env: local
+          log_type: application
+          __path__: ./logs/eulji-festival.log
+
+      - targets:
+          - localhost
+        labels:
+          service: backend
+          app: eulji-festival
+          env: local
+          log_type: error
+          __path__: ./logs/eulji-festival-error.log
+
+    pipeline_stages:
+      # Java stack trace처럼 여러 줄로 찍히는 로그를 하나의 이벤트로 묶음
+      # 로그 시작 패턴: 2026-06-28 20:00:00.123
+      - multiline:
+          firstline: '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}'
+          max_wait_time: 3s
+
+      # logback-spring.xml의 FILE_LOG_PATTERN 기준으로 level 추출
+      # 예:
+      # 2026-06-28 20:00:00.123 [main] INFO  [traceId] [GET] [/api/...] [127.0.0.1] logger - message
+      - regex:
+          expression: '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3} \[[^\]]+\]\s+(?P<level>INFO|WARN|ERROR|DEBUG|TRACE)\s+.*$'
+
+      # level을 Loki label로 추가
+      - labels:
+          level:
+
+  # 성능 측정 로그 수집
+  - job_name: eulji-festival-local-performance-logs
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          service: backend
+          app: eulji-festival
+          env: local
+          log_type: performance
+          __path__: ./logs/eulji-festival-performance.log
+
+    pipeline_stages:
+      - multiline:
+          firstline: '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}'
+          max_wait_time: 3s
