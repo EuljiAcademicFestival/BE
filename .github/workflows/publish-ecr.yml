@@ -1,0 +1,76 @@
+name: Publish backend image to ECR
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: publish-ecr-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ECR_REPOSITORY: eulji-festival-backend
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Test and build application JAR
+        run: |
+          ./gradlew test bootJar --no-daemon
+          mkdir -p "$RUNNER_TEMP/prebuilt-jar"
+          cp build/libs/Backend-0.0.1-SNAPSHOT.jar "$RUNNER_TEMP/prebuilt-jar/app.jar"
+
+      - name: Authenticate to AWS with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v6.1.2
+        with:
+          role-to-assume: arn:aws:iam::548813916405:role/eulji-festival-github-ecr-push
+          aws-region: ap-northeast-2
+
+      - name: Check for an existing image for this commit
+        id: image
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          count=$(aws ecr batch-get-image \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=$IMAGE_TAG" \
+            --query 'length(images)' --output text)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Sign in to Amazon ECR
+        if: steps.image.outputs.count == '0'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        if: steps.image.outputs.count == '0'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push image
+        if: steps.image.outputs.count == '0'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.ci
+          build-contexts: |
+            prebuilt-jar=${{ runner.temp }}/prebuilt-jar
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
