@@ -31,11 +31,6 @@ jobs:
           --health-timeout=5s
           --health-retries=20
 
-    env:
-      TEST_DB_URL: "jdbc:mysql://127.0.0.1:${{ job.services.mysql.ports[3306] }}/eulji_festival_test?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true"
-      TEST_DB_USERNAME: eulji_test
-      TEST_DB_PASSWORD: ci-test-password
-
     steps:
       - uses: actions/checkout@v6
         with:
@@ -48,4 +43,8 @@ jobs:
           cache: gradle
 
       - name: Run tests and build application JAR
+        env:
+          TEST_DB_URL: "jdbc:mysql://127.0.0.1:${{ job.services.mysql.ports[3306] }}/eulji_festival_test?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true"
+          TEST_DB_USERNAME: eulji_test
+          TEST_DB_PASSWORD: ci-test-password
         run: ./gradlew test bootJar --no-daemon
