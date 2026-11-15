@@ -9,7 +9,6 @@ import com.example.backend.member.application.command.SignupCommand;
 import com.example.backend.member.application.port.in.MemberCommandUseCase;
 import com.example.backend.member.application.port.out.AccessTokenPort;
 import org.junit.jupiter.api.*;
-import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.autoconfigure.actuate.observability.AutoConfigureObservability;
@@ -18,6 +17,9 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.mysql.MySQLContainer;
 import com.fasterxml.jackson.databind.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -28,18 +30,25 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @SpringBootTest(properties = {"realtime.engagement.enabled=false", "cache.top-rankings.ttl=PT1H"})
 @AutoConfigureMockMvc
 @AutoConfigureObservability(tracing = false)
-@EnabledIfEnvironmentVariable(named = "TEST_DB_URL", matches = ".+")
+@Testcontainers
 class BackendApplicationTests {
     private static final String JWT_TEST_SECRET = Base64.getEncoder().encodeToString(new byte[32]);
+
+    @Container
+    static final MySQLContainer MYSQL = new MySQLContainer("mysql:8.4")
+            .withDatabaseName("eulji_festival_test")
+            .withUsername("eulji_test")
+            .withPassword("ci-test-password")
+            // The rollback tests use triggers to inject storage failures.
+            .withCommand("mysqld", "--log-bin-trust-function-creators=ON")
+            .withUrlParam("connectionTimeZone", "UTC")
+            .withUrlParam("forceConnectionTimeZoneToSession", "true");
+
     @DynamicPropertySource
     static void database(DynamicPropertyRegistry registry) {
-        String url = System.getenv("TEST_DB_URL");
-        if (!url.matches("jdbc:mysql://[^/]+/eulji_festival_test(?:[?].*)?")) {
-            throw new IllegalArgumentException("Integration tests require a dedicated eulji_festival_test database");
-        }
-        registry.add("spring.datasource.url", () -> url);
-        registry.add("spring.datasource.username", () -> System.getenv().getOrDefault("TEST_DB_USERNAME", "root"));
-        registry.add("spring.datasource.password", () -> System.getenv().getOrDefault("TEST_DB_PASSWORD", ""));
+        registry.add("spring.datasource.url", MYSQL::getJdbcUrl);
+        registry.add("spring.datasource.username", MYSQL::getUsername);
+        registry.add("spring.datasource.password", MYSQL::getPassword);
         registry.add("security.jwt-secret", () -> JWT_TEST_SECRET);
         registry.add("security.jwt-issuer", () -> "eulji-academic-festival");
     }

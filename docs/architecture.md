@@ -121,17 +121,8 @@ adapter에는 JWT·회원 조회 연결과 WebSocket 전송·프로필 커밋 �
 ```
 
 기본 테스트는 도메인·커서·경과 시간·가입 검증·비밀번호 해싱을 검증한다.
-MySQL 통합 테스트는 별도 환경변수가 없으면 건너뛴다.
-
-삭제해도 되는 **테스트 전용 MySQL DB** `eulji_festival_test`를 준비하고 다음처럼 실행한다.
-테스트는 해당 DB의 데이터를 매 테스트 전에 삭제한다. 앱의 `eulji_festival` DB는 테스트에 사용하지 않는다.
-
-```bash
-export TEST_DB_URL='jdbc:mysql://127.0.0.1:13307/eulji_festival_test?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true'
-export TEST_DB_USERNAME='테스트계정'
-# TEST_DB_PASSWORD는 로컬 환경에 설정한다.
-./gradlew test --rerun-tasks
-```
+Docker를 실행한 상태에서 위 명령을 실행하면 Testcontainers가 MySQL 8.4를 띄운다.
+통합 테스트 전용 `eulji_festival_test` DB의 데이터는 매 테스트 전에 초기화되며, 테스트가 끝나면 컨테이너가 종료된다.
 
 통합 테스트는 실제 Flyway V1/V2 적용과 JPA 검증을 거친 전체 앱에서 MockMvc로 9개 API를 호출한다.
 인증·만료·잘못된 타입·회원가입 저장 실패 롤백·반복/동시 좋아요·프로필 보존·공동 순위·커서 경계를 확인한다.

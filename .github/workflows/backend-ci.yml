@@ -15,22 +15,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
-    services:
-      mysql:
-        image: mysql:8.4
-        env:
-          MYSQL_ROOT_PASSWORD: ci-root-password
-          MYSQL_DATABASE: eulji_festival_test
-          MYSQL_USER: eulji_test
-          MYSQL_PASSWORD: ci-test-password
-        ports:
-          - 3306/tcp
-        options: >-
-          --health-cmd="mysql --protocol=TCP -h 127.0.0.1 -ueulji_test -pci-test-password eulji_festival_test -e 'SELECT 1'"
-          --health-interval=5s
-          --health-timeout=5s
-          --health-retries=20
-
     steps:
       - uses: actions/checkout@v6
         with:
@@ -43,8 +27,4 @@ jobs:
           cache: gradle
 
       - name: Run tests and build application JAR
-        env:
-          TEST_DB_URL: "jdbc:mysql://127.0.0.1:${{ job.services.mysql.ports[3306] }}/eulji_festival_test?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true"
-          TEST_DB_USERNAME: eulji_test
-          TEST_DB_PASSWORD: ci-test-password
         run: ./gradlew test bootJar --no-daemon
