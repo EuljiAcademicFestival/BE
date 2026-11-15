@@ -1,0 +1,11 @@
+# 선택 사항: Grafana provisioning 폴더로 복사하면 Loki 데이터 소스를 자동 등록합니다.
+# Grafana와 Loki를 같은 Mac에서 직접 실행하는 환경 기준입니다.
+apiVersion: 1
+
+datasources:
+  - name: Loki
+    uid: eulji-loki
+    type: loki
+    access: proxy
+    url: http://127.0.0.1:3100
+    editable: true
