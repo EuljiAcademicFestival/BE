@@ -56,8 +56,13 @@ cache_size{cache="characterLabels"}
 
 ### 부하 검증 상태
 
-기능과 DB 연결 생략은 검증했다. IntelliJ Gradle 동기화와 8080 서버 재시작 후 같은 200 VU 테스트로
-캐시 적중률·전체 DB 연결 획득·API 지연을 비교해야 한다. 현재 단계에서 성능 개선이나 대기 해결을 확정하지 않는다.
+2026-11-15 19:07:48~19:16:00 KST, 재시작한 실제 8080 서버에서 같은 200 VU 혼합 부하를 완료했다.
+본 요청 411,642건의 HTTP·응답 계약 실패와 좋아요 집계 불일치는 모두 0건이었다.
+이름표 p95는 JWT 기준 15.088→4.400ms, 전체 p95는 13.072→12.048ms로 관측됐다.
+본 부하 DB 연결 획득은 361,138회로 요청당 0.877회, 요청당 1회 기준 대비 약 12.27% 감소했다.
+캐시 회원 키 적중률은 약 99.70%였으며 이름표 서비스의 실제 DB 조회는 305회였다.
+같은 5초 Prometheus 표본 pending 최대는 42→55로 높아져 순간 대기 해결로 판단하지 않는다.
+실행 조건·API별 지연·연결 횟수와 측정 한계는 [부하 결과](label-cache-load-test-result.md)를 참고한다.
 
 참고: [Caffeine 일괄 로딩과 동시성](https://github.com/ben-manes/caffeine/wiki/Faq),
 [Micrometer 캐시 계측](https://docs.micrometer.io/micrometer/reference/reference/cache.html).

@@ -24,6 +24,7 @@ public class MemberCommandService implements MemberCommandUseCase {
     private final PasswordHashPort passwords;
     private final AccessTokenPort tokens;
     private final CharacterLabelCachePort labels;
+    private final MemberProfileChangedPort profileChanges;
 
     @Override
     public SignupResult signup(SignupCommand command) {
@@ -62,6 +63,10 @@ public class MemberCommandService implements MemberCommandUseCase {
         guestbook.updateMessage(entry.withMessage(message));
         if (!member.name().equals(profile.name()) || !member.grade().equals(profile.grade())) {
             labels.evictAfterCommit(member.id());
+        }
+        if (member.characterId() != profile.characterId() || !member.name().equals(profile.name())
+                || !member.grade().equals(profile.grade())) {
+            profileChanges.afterCommit(member.id(), profile);
         }
         return new ProfileResult(member.id(), profile.characterId(), profile.name(), profile.grade(), message, entry.likeCount());
     }

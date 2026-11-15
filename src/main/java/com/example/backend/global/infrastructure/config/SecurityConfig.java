@@ -24,6 +24,8 @@ public class SecurityConfig {
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers(HttpMethod.POST, "/api/auth/signup", "/api/auth/login").permitAll()
                         .requestMatchers(HttpMethod.GET, "/actuator/health", "/actuator/prometheus").permitAll()
+                        // Only the upgrade is public; the socket requires JWT AUTH before joining or moving.
+                        .requestMatchers(HttpMethod.GET, "/ws/festival").permitAll()
                         .requestMatchers("/swagger-ui.html", "/swagger-ui/**", "/v3/api-docs", "/v3/api-docs/**",
                                 "/v3/api-docs.yaml").permitAll()
                         .anyRequest().authenticated())

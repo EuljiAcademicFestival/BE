@@ -6,6 +6,8 @@ import io.swagger.v3.oas.annotations.tags.Tag;
 import io.swagger.v3.oas.annotations.security.SecurityRequirement;
 import com.example.backend.global.adapter.in.web.ApiResponse;
 import com.example.backend.guestbook.adapter.in.web.response.CharacterDetailResponse;
+import com.example.backend.global.adapter.in.security.AuthMember;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import com.example.backend.guestbook.application.port.in.GuestbookQueryUseCase;
 import com.example.backend.guestbook.application.result.CharacterLabel;
 import lombok.RequiredArgsConstructor;
@@ -33,10 +35,11 @@ public class CharacterController {
             throw new MethodArgumentTypeMismatchException(memberIds, List.class, "memberIds", null, ex);
         }
     }
-    @Operation(summary = "근접 캐릭터 상세 조회", description = "전역 좋아요 순위가 1~3위인 경우 순위를 반환하며, 그 외는 null입니다.")
+    @Operation(summary = "근접 캐릭터 상세 조회", description = "전역 좋아요 순위가 1~3위인 경우 순위를 반환하며, 그 외는 null입니다. likedByMe는 로그인한 회원의 좋아요 선택 상태입니다.")
     @GetMapping("/{memberId}")
-    public ApiResponse<CharacterDetailResponse> detail(@PathVariable long memberId) {
+    public ApiResponse<CharacterDetailResponse> detail(
+            @Parameter(hidden = true) @AuthenticationPrincipal AuthMember member, @PathVariable long memberId) {
         return ApiResponse.ok("CHARACTER_DETAIL_200", "근접 캐릭터 상세 조회에 성공했습니다.",
-                CharacterDetailResponse.from(queries.detail(memberId)));
+                CharacterDetailResponse.from(queries.detail(member.memberId(), memberId)));
     }
 }

@@ -133,7 +133,8 @@ export default function (data) {
   success(results[1], 'GUESTBOOK_LIST_200', d => Array.isArray(d.entries) && d.entries.every(validEntry));
   success(results[2], 'CHARACTER_LABELS_200', d => Array.isArray(d.characters)
     && d.characters.some(c => c.memberId === target.memberId));
-  success(results[3], 'CHARACTER_DETAIL_200', d => validEntry(d) && d.memberId === target.memberId);
+  success(results[3], 'CHARACTER_DETAIL_200', d => validEntry(d) && d.memberId === target.memberId
+    && typeof d.likedByMe === 'boolean');
   success(results[4], 'RANKING_TOP_200', d => Array.isArray(d.rankings)
     && d.rankings.every(entry => validEntry(entry) && entry.rank !== null));
 

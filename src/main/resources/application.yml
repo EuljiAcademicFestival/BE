@@ -23,6 +23,8 @@ spring:
       accept-float-as-int: false
 
 cache:
+  top-rankings:
+    ttl: ${RANKING_TOP_CACHE_TTL:PT1S}
   character-labels:
     ttl: ${CHARACTER_LABEL_CACHE_TTL:PT5M}
     maximum-size: ${CHARACTER_LABEL_CACHE_MAXIMUM_SIZE:10000}
@@ -31,6 +33,14 @@ security:
   access-token-ttl: ${ACCESS_TOKEN_TTL:PT1H}
   jwt-secret: ${JWT_SECRET}
   jwt-issuer: ${JWT_ISSUER:eulji-academic-festival}
+
+realtime:
+  engagement:
+    interval-ms: 200
+  max-players: ${WS_MAX_PLAYERS:200}
+  coordinate-limit: ${WS_COORDINATE_LIMIT:1000}
+  max-messages-per-second: ${WS_MAX_MESSAGES_PER_SECOND:30}
+  allowed-origins: ${WS_ALLOWED_ORIGINS:http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173}
 
 springdoc:
   paths-to-match: /api/**

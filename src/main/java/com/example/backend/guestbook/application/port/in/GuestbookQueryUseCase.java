@@ -5,7 +5,7 @@ import java.util.List;
 
 public interface GuestbookQueryUseCase {
     List<CharacterLabel> labels(List<Long> memberIds);
-    EntryView detail(long memberId);
+    EntryView detail(long viewerId, long memberId);
     List<EntryView> topRankings();
     GuestbookPage page(long viewerId, String sort, String cursor, int limit);
 }

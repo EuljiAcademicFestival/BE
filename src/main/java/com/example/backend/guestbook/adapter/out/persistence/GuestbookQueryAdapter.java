@@ -17,7 +17,7 @@ public class GuestbookQueryAdapter implements GuestbookQueryPort {
     private final NamedParameterJdbcTemplate jdbc;
     // Only ranks 1..3 are exposed. Three leading rows contain every qualifying score,
     // even when ties extend beyond row three. Join scores back to include ALL tied members.
-    private static final String TOP_RANKS = """
+    static final String TOP_RANKS = """
             WITH top_scores AS (
                 SELECT like_count FROM guestbook_entries ORDER BY like_count DESC LIMIT 3
             ), top_ranks AS (
@@ -46,11 +46,11 @@ public class GuestbookQueryAdapter implements GuestbookQueryPort {
         return jdbc.query("SELECT id, grade, name FROM members WHERE id IN (:ids) ORDER BY id",
                 Map.of("ids", ids), (rs, row) -> new CharacterLabel(rs.getLong("id"), rs.getString("grade"), rs.getString("name")));
     }
-    public Optional<EntryView> detail(long memberId) {
+    public Optional<EntryView> detail(long viewerId, long memberId) {
         return jdbc.query(TOP_RANKS + SELECT_ENTRY
                         + " FROM guestbook_entries e JOIN members m ON m.id = e.member_id"
                         + " LEFT JOIN top_ranks r ON r.like_count = e.like_count WHERE e.member_id = :memberId",
-                Map.of("viewerId", 0L, "memberId", memberId), ENTRY)
+                Map.of("viewerId", viewerId, "memberId", memberId), ENTRY)
                 .stream().findFirst();
     }
     public List<EntryView> topRankings() {

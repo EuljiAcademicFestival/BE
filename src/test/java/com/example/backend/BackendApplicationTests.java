@@ -25,7 +25,7 @@ import static org.assertj.core.api.Assertions.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 
-@SpringBootTest
+@SpringBootTest(properties = {"realtime.engagement.enabled=false", "cache.top-rankings.ttl=PT1H"})
 @AutoConfigureMockMvc
 @AutoConfigureObservability(tracing = false)
 @EnabledIfEnvironmentVariable(named = "TEST_DB_URL", matches = ".+")
@@ -61,9 +61,16 @@ class BackendApplicationTests {
     @org.springframework.test.context.bean.override.mockito.MockitoSpyBean
     com.example.backend.guestbook.adapter.out.persistence.GuestbookQueryAdapter queryAdapter;
     @Autowired com.example.backend.guestbook.application.port.in.GuestbookQueryUseCase cachedQueries;
+    @Autowired com.example.backend.guestbook.adapter.out.cache.CaffeineTopRankingCache rankingCache;
+    @Autowired com.example.backend.realtime.application.port.in.EngagementSyncUseCase engagementSync;
+    @org.springframework.test.context.bean.override.mockito.MockitoSpyBean
+    com.example.backend.guestbook.adapter.out.persistence.EngagementQueryAdapter engagementQueryAdapter;
+    @org.springframework.test.context.bean.override.mockito.MockitoSpyBean
+    com.example.backend.realtime.adapter.in.websocket.PresenceSocketTransport socketTransport;
 
     @BeforeEach
     void cleanTestDatabase() {
+        rankingCache.invalidate();
         jdbc.update("DELETE FROM access_tokens");
         jdbc.update("DELETE FROM guestbook_likes");
         jdbc.update("DELETE FROM guestbook_entries");
@@ -236,6 +243,60 @@ class BackendApplicationTests {
         var timers = metrics.find("hikaricp.connections.acquire").timers();
         assertThat(timers).isNotEmpty();
         return timers.stream().mapToLong(io.micrometer.core.instrument.Timer::count).sum();
+    }
+
+    @Test
+    void allQueryPathsUseReadOnlyTransactionsAndConnections() {
+        long a = fixture("query-mode-a@example.com"), b = fixture("query-mode-b@example.com");
+        var inspected = new java.util.concurrent.atomic.AtomicInteger();
+        org.mockito.stubbing.Answer<Object> inspect = invocation -> {
+            assertThat(org.springframework.transaction.support.TransactionSynchronizationManager.isActualTransactionActive()).isTrue();
+            assertThat(org.springframework.transaction.support.TransactionSynchronizationManager.isCurrentTransactionReadOnly()).isTrue();
+            var connection = org.springframework.jdbc.datasource.DataSourceUtils.getConnection(dataSource);
+            try {
+                assertThat(connection.getAutoCommit()).isFalse();
+                assertThat(connection.isReadOnly()).isTrue();
+            } finally { org.springframework.jdbc.datasource.DataSourceUtils.releaseConnection(connection, dataSource); }
+            inspected.incrementAndGet();
+            return invocation.callRealMethod();
+        };
+        org.mockito.Mockito.doAnswer(inspect).when(queryAdapter).labels(org.mockito.ArgumentMatchers.anyList());
+        org.mockito.Mockito.doAnswer(inspect).when(queryAdapter).detail(org.mockito.ArgumentMatchers.anyLong(),org.mockito.ArgumentMatchers.anyLong());
+        org.mockito.Mockito.doAnswer(inspect).when(queryAdapter).topRankings();
+        org.mockito.Mockito.doAnswer(inspect).when(queryAdapter).page(org.mockito.ArgumentMatchers.anyLong(),org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.anyInt());
+        long before = connectionAcquisitions();
+        assertThat(cachedQueries.labels(List.of(a,b))).hasSize(2);
+        assertThat(cachedQueries.detail(a,b).memberId()).isEqualTo(b);
+        assertThat(cachedQueries.topRankings()).hasSize(2);
+        assertThat(cachedQueries.page(a,"popular",null,20).entries()).hasSize(2);
+        assertThat(cachedQueries.page(a,"latest",null,20).entries()).hasSize(2);
+        assertThat(inspected).hasValue(5);
+        assertThat(connectionAcquisitions()).isEqualTo(before+5);
+    }
+
+    @Test
+    void rankingCacheHitSkipsDatabaseAndTransactionsWhileOuterTransactionBypassesIt() throws Exception {
+        long a = fixture("ranking-cache-a@example.com"), b = fixture("ranking-cache-b@example.com");
+        String auth = "Bearer " + tokens.issue(a);
+        long before = connectionAcquisitions();
+        mvc.perform(get("/api/rankings/top").header("Authorization",auth))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.data.rankings.length()").value(2))
+                .andExpect(jsonPath("$.data.rankings[0].likedByMe").doesNotExist());
+        assertThat(connectionAcquisitions()).isEqualTo(before+1);
+        org.mockito.Mockito.clearInvocations(queryAdapter);
+        before = connectionAcquisitions();
+        mvc.perform(get("/api/rankings/top").header("Authorization",auth)).andExpect(status().isOk());
+        assertThat(connectionAcquisitions()).isEqualTo(before);
+        org.mockito.Mockito.verify(queryAdapter,org.mockito.Mockito.never()).topRankings();
+        // The outer transaction must see its own changes, and rollback must not poison the snapshot.
+        var tx = new org.springframework.transaction.support.TransactionTemplate(transactionManager);
+        tx.executeWithoutResult(status -> {
+            jdbc.update("UPDATE guestbook_entries SET like_count=20 WHERE member_id=?",b);
+            assertThat(cachedQueries.topRankings().get(0).memberId()).isEqualTo(b);
+            assertThat(cachedQueries.topRankings().get(0).likeCount()).isEqualTo(20);
+            status.setRollbackOnly();
+        });
+        assertThat(cachedQueries.topRankings()).allSatisfy(e -> assertThat(e.likeCount()).isZero());
     }
 
     @Test
@@ -541,6 +602,8 @@ class BackendApplicationTests {
         likes.setLike(ids.get(0), ids.get(5), true);
         likes.setLike(ids.get(1), ids.get(4), true);
         likes.setLike(ids.get(2), ids.get(4), true);
+        // Check SQL ranking rules after a forced refresh; expiry itself uses a deterministic ticker test.
+        rankingCache.invalidate();
         mvc.perform(get("/api/rankings/top").header("Authorization", "Bearer " + token))
                 .andExpect(status().isOk()).andExpect(jsonPath("$.data.rankings.length()").value(3))
                 .andExpect(jsonPath("$.data.rankings[0].rank").value(1))
@@ -602,6 +665,81 @@ class BackendApplicationTests {
     }
 
     @Test
+    void characterDetailShowsViewerLikeStateAfterLikeAndUnlike() throws Exception {
+        long alice = fixture("detail-alice@example.com");
+        long bob = fixture("detail-bob@example.com");
+        long target = fixture("detail-target@example.com");
+        String aliceAuth = "Bearer " + tokens.issue(alice);
+        String bobAuth = "Bearer " + tokens.issue(bob);
+        String detail = "/api/characters/" + target;
+        mvc.perform(get(detail)).andExpect(status().isUnauthorized());
+        mvc.perform(get(detail).header("Authorization", aliceAuth))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.data.memberId").value(target))
+                .andExpect(jsonPath("$.data.likedByMe").value(false))
+                .andExpect(jsonPath("$.data.likeCount").value(0));
+        mvc.perform(put("/api/guestbook/" + target + "/like").header("Authorization", aliceAuth))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.data.likedByMe").value(true));
+        mvc.perform(get(detail).header("Authorization", aliceAuth))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.data.likedByMe").value(true))
+                .andExpect(jsonPath("$.data.likeCount").value(1));
+        // The viewer comes from authentication, not a caller-supplied member ID.
+        mvc.perform(get(detail).param("viewerId", Long.toString(alice)).header("Authorization", bobAuth))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.data.likedByMe").value(false))
+                .andExpect(jsonPath("$.data.likeCount").value(1));
+        mvc.perform(put("/api/guestbook/" + target + "/like").header("Authorization", bobAuth))
+                .andExpect(status().isOk());
+        mvc.perform(delete("/api/guestbook/" + target + "/like").header("Authorization", aliceAuth))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.data.likedByMe").value(false));
+        mvc.perform(get(detail).header("Authorization", aliceAuth))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.data.likedByMe").value(false))
+                .andExpect(jsonPath("$.data.likeCount").value(1));
+        mvc.perform(get(detail).header("Authorization", bobAuth))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.data.likedByMe").value(true));
+        mvc.perform(get("/api/rankings/top").header("Authorization", aliceAuth))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.data.rankings[0].memberId").value(target))
+                .andExpect(jsonPath("$.data.rankings[0].likedByMe").doesNotExist());
+    }
+
+    @Test
+    void committedLikeChangesAreReadOnceAndRepeatedRequestsDoNotPublishAgain() throws Exception {
+        long alice=fixture("push-alice@example.com"),bob=fixture("push-bob@example.com"),target=fixture("push-target@example.com");
+        String a="Bearer "+tokens.issue(alice),b="Bearer "+tokens.issue(bob);
+        org.mockito.Mockito.when(socketTransport.hasSubscribers()).thenReturn(true);
+        engagementSync.flush();
+        org.mockito.Mockito.clearInvocations(engagementQueryAdapter,socketTransport);
+        mvc.perform(put("/api/guestbook/"+target+"/like").header("Authorization",a)).andExpect(status().isOk());
+        mvc.perform(put("/api/guestbook/"+target+"/like").header("Authorization",b)).andExpect(status().isOk());
+        mvc.perform(delete("/api/guestbook/"+target+"/like").header("Authorization",a)).andExpect(status().isOk());
+        org.mockito.Mockito.verifyNoInteractions(engagementQueryAdapter);
+        engagementSync.flush();
+        org.mockito.Mockito.verify(engagementQueryAdapter).snapshot(Set.of(target),false);
+        var event=org.mockito.ArgumentCaptor.forClass(com.example.backend.realtime.application.result.PresenceEvent.class);
+        org.mockito.Mockito.verify(socketTransport).broadcast(event.capture(),org.mockito.ArgumentMatchers.isNull());
+        var state=(com.example.backend.realtime.application.result.EngagementState)event.getValue().data();
+        assertThat(state.counts()).contains(new com.example.backend.guestbook.application.result.EngagementSnapshot.Count(target,1));
+        assertThat(state.rankings()).extracting(r -> r.memberId()).containsExactly(target,alice,bob);
+        org.mockito.Mockito.clearInvocations(engagementQueryAdapter,socketTransport);
+        mvc.perform(put("/api/guestbook/"+target+"/like").header("Authorization",b)).andExpect(status().isOk());
+        engagementSync.flush();
+        org.mockito.Mockito.verifyNoInteractions(engagementQueryAdapter);
+        org.mockito.Mockito.verify(socketTransport,org.mockito.Mockito.never()).broadcast(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any());
+    }
+
+    @Test
+    void rolledBackLikeChangeNeverEntersRealtimeBatch() {
+        long actor=fixture("rollback-push-actor@example.com"),target=fixture("rollback-push-target@example.com");
+        org.mockito.Mockito.when(socketTransport.hasSubscribers()).thenReturn(true);
+        engagementSync.flush();org.mockito.Mockito.clearInvocations(engagementQueryAdapter,socketTransport);
+        new org.springframework.transaction.support.TransactionTemplate(transactionManager).executeWithoutResult(status -> {
+            likes.setLike(target,actor,true);status.setRollbackOnly();
+        });
+        engagementSync.flush();
+        org.mockito.Mockito.verifyNoInteractions(engagementQueryAdapter);
+        org.mockito.Mockito.verify(socketTransport,org.mockito.Mockito.never()).broadcast(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any());
+        assertThat(jdbc.queryForObject("SELECT like_count FROM guestbook_entries WHERE member_id=?",Long.class,target)).isZero();
+    }
+
+    @Test
     void optimizedQueriesMatchFullGlobalRankingAcrossTiesAndPages() {
         List<int[]> distributions = List.of(new int[0], new int[]{0}, new int[]{5, 5},
                 new int[]{0, 0, 0, 0, 0, 0}, new int[]{9, 9, 9, 8, 7},
@@ -624,8 +762,19 @@ class BackendApplicationTests {
             }
             List<EntryView> global = fullRankingReference(0, GuestbookSort.POPULAR);
             assertThat(queries.topRankings()).containsExactlyElementsOf(global.stream().filter(e -> e.rank() != null).toList());
-            assertThat(queries.detail(Long.MAX_VALUE)).isEmpty();
-            for (EntryView entry : global) assertThat(queries.detail(entry.memberId())).contains(entry);
+            Set<Long> changedIds=ids.isEmpty()?Set.of():Set.of(ids.get(ids.size()-1));
+            for(boolean full:List.of(false,true)) {
+                var snapshot=engagementQueryAdapter.snapshot(changedIds,full);
+                assertThat(snapshot.rankings()).containsExactlyElementsOf(global.stream().filter(e -> e.rank()!=null)
+                        .map(com.example.backend.guestbook.application.result.EngagementSnapshot.Ranking::from).toList());
+                assertThat(snapshot.counts()).containsExactlyInAnyOrderElementsOf(global.stream()
+                        .filter(e -> full||e.rank()!=null||changedIds.contains(e.memberId()))
+                        .map(e -> new com.example.backend.guestbook.application.result.EngagementSnapshot.Count(e.memberId(),e.likeCount())).toList());
+            }
+            assertThat(queries.detail(viewer, Long.MAX_VALUE)).isEmpty();
+            for (EntryView entry : fullRankingReference(viewer, GuestbookSort.POPULAR)) {
+                assertThat(queries.detail(viewer, entry.memberId())).contains(entry);
+            }
             for (GuestbookSort sort : GuestbookSort.values()) {
                 List<EntryView> expected = fullRankingReference(viewer, sort);
                 for (int size : List.of(1, 3, 21, 100)) {

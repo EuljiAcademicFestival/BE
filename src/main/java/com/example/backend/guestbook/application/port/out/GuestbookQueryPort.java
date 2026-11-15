@@ -6,7 +6,7 @@ import java.util.*;
 
 public interface GuestbookQueryPort {
     List<CharacterLabel> labels(List<Long> memberIds);
-    Optional<EntryView> detail(long memberId);
+    Optional<EntryView> detail(long viewerId, long memberId);
     List<EntryView> topRankings();
     List<EntryView> page(long viewerId, GuestbookSort sort, GuestbookCursor cursor, int fetchSize);
 }

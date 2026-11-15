@@ -12,6 +12,21 @@ import static org.mockito.Mockito.*;
 
 class GuestbookQueryServiceTest {
     @Test
+    void detailPassesAuthenticatedViewerToQueryAndRejectsInvalidIds() {
+        var queries = mock(GuestbookQueryPort.class);
+        var entry = new EntryView(2, 1, "게스트", "이름", 1, "환영", Instant.EPOCH, 1, true);
+        when(queries.detail(1, 2)).thenReturn(Optional.of(entry));
+        var service = new GuestbookQueryService(queries, Clock.systemUTC());
+        assertThat(service.detail(1, 2)).isEqualTo(entry);
+        verify(queries).detail(1, 2);
+        assertThatThrownBy(() -> service.detail(0, 2))
+                .isInstanceOf(com.example.backend.global.domain.exception.BusinessException.class);
+        assertThatThrownBy(() -> service.detail(1, 0))
+                .isInstanceOf(com.example.backend.global.domain.exception.BusinessException.class);
+        verifyNoMoreInteractions(queries);
+    }
+
+    @Test
     void computesElapsedTextAtOneRequestTimeAndReturnsNextCursor() {
         Instant now = Instant.parse("2026-11-13T00:00:00Z");
         var queries = mock(GuestbookQueryPort.class);

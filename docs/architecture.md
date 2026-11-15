@@ -48,7 +48,7 @@ DataSource와 JpaTransactionManager의 트랜잭션을 공유한다.
 | POST | `/api/auth/login` | [로그인](https://app.notion.com/p/41413f22e20281148796f14d904894df) | 비밀번호 검증, 액세스 토큰 반환 |
 | PUT | `/api/members/me/profile` | [프로필 수정](https://app.notion.com/p/41413f22e20281f29aa3e7af70f1724e) | 토큰의 본인 수정, 기존 좋아요와 작성 시각 유지 |
 | GET | `/api/characters?memberIds=11,12` | [이름표](https://app.notion.com/p/41413f22e20281088285e9d108b4a340) | 없는 ID 제외, 결과가 없으면 빈 배열 |
-| GET | `/api/characters/{memberId}` | [상세](https://app.notion.com/p/41413f22e2028167811adacd6442a70f) | 전역 좋아요 기준 순위, 1~3위 외 null |
+| GET | `/api/characters/{memberId}` | [상세](https://app.notion.com/p/41413f22e2028167811adacd6442a70f) | 전역 좋아요 기준 순위, 1~3위 외 null, 로그인한 회원의 `likedByMe` |
 | GET | `/api/rankings/top` | [순위](https://app.notion.com/p/41413f22e20281f8a921dae9193be40e) | 공동 순위를 포함한 1~3위 전원 반환 |
 | GET | `/api/guestbook` | [방명록 목록](https://app.notion.com/p/41413f22e20281c5b476eff5b8c3909e) | 인기순 기본, 최신순, 커서, 작성 경과 시간 |
 | PUT | `/api/guestbook/{memberId}/like` | [좋아요 등록](https://app.notion.com/p/41413f22e20281a993cae7a21f3a6d32) | 반복 등록에 중복 집계 없음 |
@@ -57,6 +57,13 @@ DataSource와 JpaTransactionManager의 트랜잭션을 공유한다.
 HTTP 상태와 `status`, `code`, `message`, `data` 응답 구조는 명세를 따른다.
 실패 응답은 동일한 구조로 `data: null`을 반환한다. 회원가입·로그인 외 API는
 `Authorization: Bearer {accessToken}`이 필요하다.
+
+근접 캐릭터 상세의 `likedByMe`는 로그인한 회원이 대상 방명록에 좋아요를 눌렀는지 나타낸다.
+좋아요 등록 후 true, 취소 후 false를 반환하며 다른 회원의 선택 상태와 구분한다.
+조회자 ID는 인증 정보에서 가져오고 클라이언트의 입력으로 받지 않는다.
+기존 상세 SELECT의 EXISTS에서 함께 계산하므로 추가 쿼리는 실행하지 않는다.
+상위 순위는 별도 응답 DTO를 사용해 기존 공통 응답 형식을 유지한다.
+상세 결과는 사용자별 필드를 포함하므로 향후 회원 ID만으로 전체 응답을 공통 캐시하지 않는다.
 
 ## 데이터 규칙과 동시성
 
@@ -96,8 +103,16 @@ HTTP 상태와 `status`, `code`, `message`, `data` 응답 구조는 명세를 �
 기존 V1·V2 마이그레이션과 회원·방명록 데이터는 유지한다.
 V2의 `access_tokens` 테이블은 이력 호환을 위해 남겨두며 JWT 발급·검증에는 사용하지 않는다.
 
-근접 거리 판단, 캐릭터 이동, 순위 갱신 주기, 화면 스크롤·정렬 전환 응답 처리는 클라이언트 영역이며
-서버 API에는 근접 거리나 이동 프로토콜을 추가하지 않았다.
+3D 렌더링·이동 조작·근접 거리 판단·화면 스크롤은 클라이언트 영역이다.
+캐릭터 입장·퇴장·위치·방향 공유는 `realtime` 도메인의 WebSocket으로 처리한다.
+도메인에는 위치·신원 규칙, application에는 입력/출력 포트와 메모리 공간 처리,
+adapter에는 JWT·회원 조회 연결과 WebSocket 전송·프로필 커밋 후 알림을 둔다.
+고빈도 상태 처리는 `application.presence`에 두어 메서드별 INFO 성능 로그를 생성하지 않는다.
+회원 수정 서비스는 출력 포트를 통해 커밋 후 변경을 전파한다. 이동은 DB 트랜잭션을 사용하지 않는다.
+좋아요 서비스는 출력 포트로 실제 변경을 커밋 후 표시하고, `application.sync`가 기본 200ms마다 합친다.
+별도의 조회 출력 포트가 좋아요 수와 공동 순위를 한 SELECT에서 읽고 DB 연결을 반납한 뒤 WebSocket으로 전송한다.
+롤백·중복 요청은 전파하지 않으며, 개인별 likedByMe는 REST 응답으로 처리한다.
+[WebSocket 명세와 한계](websocket.md)를 참고한다.
 
 ## 검증 실행
 

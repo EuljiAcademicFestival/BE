@@ -21,9 +21,9 @@ public class GuestbookQueryService implements GuestbookQueryUseCase {
     public List<CharacterLabel> labels(List<Long> memberIds) {
         return queries.labels(CharacterLabelPolicy.normalizeIds(memberIds));
     }
-    public EntryView detail(long memberId) {
-        if (memberId <= 0) throw new BusinessException(ErrorCode.CHARACTER_INVALID_INPUT);
-        return queries.detail(memberId).orElseThrow(() -> new BusinessException(ErrorCode.CHARACTER_NOT_FOUND));
+    public EntryView detail(long viewerId, long memberId) {
+        if (viewerId <= 0 || memberId <= 0) throw new BusinessException(ErrorCode.CHARACTER_INVALID_INPUT);
+        return queries.detail(viewerId, memberId).orElseThrow(() -> new BusinessException(ErrorCode.CHARACTER_NOT_FOUND));
     }
     public List<EntryView> topRankings() { return queries.topRankings(); }
     public GuestbookPage page(long viewerId, String sortValue, String cursorValue, int limit) {

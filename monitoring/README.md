@@ -38,6 +38,9 @@ Gymjjak은 get/find 접두사 메서드를 측정하지만, 학술제는 실제 
 application service 메서드를 측정합니다. 성능 파일의 시간은 메서드 시간이며 HTTP 전체 지연은
 k6 또는 Prometheus로 함께 확인합니다. Actuator·Swagger 경로는 요청 완료 로그에서 제외합니다.
 
+성능 로그는 개발·prod 환경 모두 `eulji-festival-performance.log` 파일에만 기록하고
+콘솔에는 출력하지 않습니다. 파일을 통한 Promtail·Loki 수집은 유지됩니다.
+
 ## 3. Loki 실행
 
 Backend 프로젝트 루트의 터미널에서 다운로드한 실행 파일의 실제 경로를 전달합니다.

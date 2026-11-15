@@ -14,6 +14,7 @@ import org.springframework.transaction.annotation.Transactional;
 public class GuestbookCommandService implements GuestbookCommandUseCase {
     private final GuestbookPort guestbook;
     private final GuestbookLikePort likes;
+    private final GuestbookEngagementChangedPort engagement;
 
     public LikeResult setLike(long memberId, long likerId, boolean liked) {
         if (memberId <= 0) throw new BusinessException(ErrorCode.GUESTBOOK_INVALID_MEMBER_ID);
@@ -24,6 +25,7 @@ public class GuestbookCommandService implements GuestbookCommandUseCase {
         if (changed) {
             count += liked ? 1 : -1;
             guestbook.updateLikeCount(memberId, count);
+            engagement.afterCommit(memberId);
         }
         return new LikeResult(memberId, liked, count);
     }
