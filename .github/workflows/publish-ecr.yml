@@ -1,4 +1,4 @@
-name: Publish backend image to ECR
+name: Publish backend image and deploy to EC2
 
 on:
   push:
@@ -6,19 +6,20 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: publish-ecr-${{ github.sha }}
+  group: deploy-backend-production
   cancel-in-progress: false
 
 jobs:
   publish:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
       id-token: write
     env:
       ECR_REPOSITORY: eulji-festival-backend
+      EC2_INSTANCE_ID: i-01cb292ab7078a1d6
 
     steps:
       - uses: actions/checkout@v6
@@ -74,3 +75,52 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Deploy image to EC2 and verify health
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          if [[ "$IMAGE_TAG" != "$main_sha" ]]; then
+            echo 'Skipping deployment because main has moved to another commit.'
+            exit 0
+          fi
+
+          digest=$(aws ecr batch-get-image \
+            --repository-name "$ECR_REPOSITORY" \
+            --image-ids "imageTag=$IMAGE_TAG" \
+            --query 'images[0].imageId.imageDigest' --output text)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          parameters=$(jq -n --arg digest "$digest" --rawfile script scripts/deploy-ec2.sh \
+            '{commands: [("bash -s -- " + ($digest | @sh) + " <<\u0027EULJI_DEPLOY_SCRIPT\u0027\n" + $script + "\nEULJI_DEPLOY_SCRIPT")], executionTimeout: ["600"]}')
+          command_id=$(aws ssm send-command \
+            --document-name AWS-RunShellScript \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --timeout-seconds 120 \
+            --parameters "$parameters" \
+            --query 'Command.CommandId' --output text)
+          echo "SSM command: $command_id"
+
+          for attempt in {1..80}; do
+            if result=$(aws ssm get-command-invocation \
+              --command-id "$command_id" --instance-id "$EC2_INSTANCE_ID" \
+              --output json 2>"$RUNNER_TEMP/ssm-error"); then
+              status=$(jq -r '.Status' <<< "$result")
+              case "$status" in
+                Pending|InProgress|Delayed|Cancelling) ;;
+                *)
+                  jq '{Status, StatusDetails, ResponseCode, StandardOutputContent, StandardErrorContent}' <<< "$result"
+                  [[ "$status" == Success ]]
+                  exit
+                  ;;
+              esac
+            elif ! grep -q InvocationDoesNotExist "$RUNNER_TEMP/ssm-error"; then
+              cat "$RUNNER_TEMP/ssm-error" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for SSM command $command_id" >&2
+          exit 1
